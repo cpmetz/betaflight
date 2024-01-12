@@ -44,6 +44,8 @@
 #include "rx/sbus.h"
 #include "rx/sbus_channels.h"
 
+#include "fc/runtime_config.h"
+
 /*
  * Observations
  *
@@ -108,6 +110,36 @@ typedef struct sbusFrameData_s {
     bool done;
 } sbusFrameData_t;
 
+/*
+ * Data structures for emulation of a momentary toggle switch.
+ * To be used with DJI RC2 controllers, to facilitate a PREARM
+ * setup.
+ *
+ * DJI controllers don't have a momentary toggle switch. Perform
+ * edge detection on the channels to simulate this.
+ */
+typedef enum {
+    RC2_EDGE_UNINITIALIZED,
+    RC2_EDGE_WAITING_FOR_EDGE,
+    RC2_EDGE_ACTIVE
+} djiEdgeDetectionState_t;
+
+typedef struct {
+    djiEdgeDetectionState_t state;
+    timeUs_t timeOfEdgeDetection;
+    uint16_t value;
+} djiEdgeDetection_t;
+
+static uint8_t djiVirtualPreArmMonitorChannel = 0;
+static uint8_t djiVirtualArmMonitorChannel = 0;
+
+#define DJI_VIRTUAL_PREARM_CHANNEL (14)
+#define DJI_VIRTUAL_PREARM_TIMEOUT_US (250000)
+
+#define DJI_VIRTUAL_ARM_CHANNEL (15)
+#define DJI_VIRTUAL_DISARM_WINDOW_US (200000)
+#define DJI_VIRTUAL_DISARM_NUMBER_OF_EDGES_IN_WINDOW (2)
+
 // Receive ISR callback
 static void sbusDataReceive(uint16_t c, void *data)
 {
@@ -139,6 +171,127 @@ static void sbusDataReceive(uint16_t c, void *data)
     }
 }
 
+STATIC_UNIT_TESTED void djiVirtualPreArm(rxRuntimeState_t *rxRuntimeState, const uint8_t frameStatus)
+{
+    static djiEdgeDetection_t toggleDetection = {
+        .state = RC2_EDGE_UNINITIALIZED
+    };
+
+    // When having bad data, don't do edge detection; just stay inactive.
+    if (frameStatus & (RX_FRAME_FAILSAFE | RX_FRAME_DROPPED)) {
+        rxRuntimeState->channelData[DJI_VIRTUAL_PREARM_CHANNEL] = SBUS_DIGITAL_CHANNEL_MIN;
+        toggleDetection.state = RC2_EDGE_UNINITIALIZED;
+        return;
+    }
+
+    const uint16_t channelValue = rxRuntimeState->channelData[djiVirtualPreArmMonitorChannel];
+    const timeUs_t currentTimeUs = rxRuntimeState->lastRcFrameTimeUs;
+
+    uint16_t virtualValue = SBUS_DIGITAL_CHANNEL_MIN;
+
+    switch (toggleDetection.state) {
+        case RC2_EDGE_UNINITIALIZED:
+            toggleDetection.value = channelValue;
+            toggleDetection.state = RC2_EDGE_WAITING_FOR_EDGE;
+            // intentional fall-through.
+        case RC2_EDGE_WAITING_FOR_EDGE:
+            if (channelValue == toggleDetection.value) {
+                break;
+            }
+            toggleDetection.timeOfEdgeDetection = currentTimeUs;
+            toggleDetection.state = RC2_EDGE_ACTIVE;
+            // intentional fall-through.
+        case RC2_EDGE_ACTIVE:
+            // On an active edge, raise the toggle channel for a given amount of time.
+            if (currentTimeUs - toggleDetection.timeOfEdgeDetection <= DJI_VIRTUAL_PREARM_TIMEOUT_US) {
+                virtualValue = SBUS_DIGITAL_CHANNEL_MAX;
+            } else {
+                // After the timeout, go back into edge detection state,
+                // and deassert the channel value consequently.
+                toggleDetection.state = RC2_EDGE_WAITING_FOR_EDGE;
+            }
+            break;
+        default:
+            break;
+    }
+    rxRuntimeState->channelData[DJI_VIRTUAL_PREARM_CHANNEL] = virtualValue;
+
+    toggleDetection.value = channelValue;
+}
+
+STATIC_UNIT_TESTED void djiVirtualArm(rxRuntimeState_t *rxRuntimeState, const uint8_t frameStatus)
+{
+    static djiEdgeDetection_t toggleDetection = {
+        .state = RC2_EDGE_UNINITIALIZED
+    };
+    static uint8_t outputState = 0;
+    static uint8_t numberOfEdgesInWindow = 0;
+
+    // If we have a failsafe or drop, retain the last known value.
+    // Perform an edge detection on garbage data would be unwise.
+    if (frameStatus & (RX_FRAME_FAILSAFE | RX_FRAME_DROPPED)) {
+        rxRuntimeState->channelData[DJI_VIRTUAL_ARM_CHANNEL] = outputState ?
+            SBUS_DIGITAL_CHANNEL_MAX : SBUS_DIGITAL_CHANNEL_MIN;
+        toggleDetection.state = RC2_EDGE_UNINITIALIZED;
+        return;
+    }
+
+    const uint16_t channelValue = rxRuntimeState->channelData[djiVirtualArmMonitorChannel];
+    const timeUs_t currentTimeUs = rxRuntimeState->lastRcFrameTimeUs;
+
+    switch (toggleDetection.state) {
+        case RC2_EDGE_UNINITIALIZED:
+            toggleDetection.value = channelValue;
+            toggleDetection.state = RC2_EDGE_WAITING_FOR_EDGE;
+            outputState = 0;
+            // intentional fall-through.
+        case RC2_EDGE_WAITING_FOR_EDGE:
+            if (channelValue == toggleDetection.value) {
+                break;
+            }
+            // We detected a button press.
+            toggleDetection.timeOfEdgeDetection = currentTimeUs;
+            toggleDetection.state = RC2_EDGE_ACTIVE;
+
+            // Update the toggle value to not double-count during
+            // the active edge.
+            toggleDetection.value = channelValue;
+            numberOfEdgesInWindow = 1;
+            // intentional fall-through.
+        case RC2_EDGE_ACTIVE:
+            if (!ARMING_FLAG(ARMED)) {
+                outputState ^= 1;
+                toggleDetection.state = RC2_EDGE_WAITING_FOR_EDGE;
+                break;
+            }
+            // We are armed. Count edges while in the disarm window.
+            if (currentTimeUs - toggleDetection.timeOfEdgeDetection <= DJI_VIRTUAL_DISARM_WINDOW_US) {
+                if (channelValue != toggleDetection.value) {
+                    numberOfEdgesInWindow++;
+                }
+                // When reaching the threshold, reset the output value.
+                if (numberOfEdgesInWindow >= DJI_VIRTUAL_DISARM_NUMBER_OF_EDGES_IN_WINDOW) {
+                    // forcefully set to disarm.
+                    outputState = 0;
+                    toggleDetection.state = RC2_EDGE_WAITING_FOR_EDGE;
+                    break;
+                }
+            } else {
+                // We were armed, but did not see enough edges.
+                // Discard event by not modifying outputState.
+                toggleDetection.state = RC2_EDGE_WAITING_FOR_EDGE;
+                break;
+            }
+            break;
+        default:
+            break;
+    }
+    rxRuntimeState->channelData[DJI_VIRTUAL_ARM_CHANNEL] = outputState ?
+        SBUS_DIGITAL_CHANNEL_MAX : SBUS_DIGITAL_CHANNEL_MIN;
+
+    toggleDetection.value = channelValue;
+}
+
 static uint8_t sbusFrameStatus(rxRuntimeState_t *rxRuntimeState)
 {
     sbusFrameData_t *sbusFrameData = rxRuntimeState->frameData;
@@ -155,6 +308,13 @@ static uint8_t sbusFrameStatus(rxRuntimeState_t *rxRuntimeState)
         rxRuntimeState->lastRcFrameTimeUs = sbusFrameData->startAtUs;
     }
 
+    if (djiVirtualPreArmMonitorChannel) {
+        djiVirtualPreArm(rxRuntimeState, frameStatus);
+    }
+    if (djiVirtualArmMonitorChannel) {
+        djiVirtualArm(rxRuntimeState, frameStatus);
+    }
+
     return frameStatus;
 }
 
@@ -163,6 +323,9 @@ bool sbusInit(const rxConfig_t *rxConfig, rxRuntimeState_t *rxRuntimeState)
     static uint16_t sbusChannelData[SBUS_MAX_CHANNEL];
     static sbusFrameData_t sbusFrameData;
     static uint32_t sbusBaudRate;
+
+    djiVirtualPreArmMonitorChannel = rxConfig->djiVirtualPreArmMonitorChannel;
+    djiVirtualArmMonitorChannel = rxConfig->djiVirtualArmMonitorChannel;
 
     rxRuntimeState->channelData = sbusChannelData;
     rxRuntimeState->frameData = &sbusFrameData;

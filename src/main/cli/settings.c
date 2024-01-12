@@ -752,6 +752,8 @@ const clivalue_t valueTable[] = {
     { "rssi_invert",                VAR_INT8   | MASTER_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_RX_CONFIG, offsetof(rxConfig_t, rssi_invert) },
     { "rssi_src_frame_lpf_period",  VAR_UINT8  | MASTER_VALUE, .config.minmaxUnsigned = { 0, UINT8_MAX }, PG_RX_CONFIG, offsetof(rxConfig_t, rssi_src_frame_lpf_period) },
     { "rssi_smoothing",             VAR_UINT8  | MASTER_VALUE, .config.minmaxUnsigned = { 0, UINT8_MAX }, PG_RX_CONFIG, offsetof(rxConfig_t, rssi_smoothing) },
+    { "dji_vprearm_channel",        VAR_UINT8  | MASTER_VALUE, .config.minmaxUnsigned = { 0, 16 }, PG_RX_CONFIG, offsetof(rxConfig_t, djiVirtualPreArmMonitorChannel) },
+    { "dji_varm_channel",           VAR_UINT8  | MASTER_VALUE, .config.minmaxUnsigned = { 0, 16 }, PG_RX_CONFIG, offsetof(rxConfig_t, djiVirtualArmMonitorChannel) },
 
 #ifdef USE_RC_SMOOTHING_FILTER
     { PARAM_NAME_RC_SMOOTHING,                   VAR_UINT8  | MASTER_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_RX_CONFIG, offsetof(rxConfig_t, rc_smoothing_mode) },
